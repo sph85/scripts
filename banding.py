@@ -284,9 +284,11 @@ def label_table(name, spec):
         lows, highs = [-np.inf, *spec["edges"]], [*spec["edges"], np.inf]
         rows = [(MISSING_CODE, "Missing", None, None)]
         rows += [(i + 1, l, lo, hi) for i, (l, lo, hi) in enumerate(zip(labs, lows, highs))]
-        return pd.DataFrame(rows, columns=["code", "label", "lower", "upper"]).assign(factor=name)
-    rows = [(MISSING_CODE, "Missing")] + [(i + 1, l) for i, l in enumerate(spec["levels"])]
-    return pd.DataFrame(rows, columns=["code", "label"]).assign(factor=name)
+        t = pd.DataFrame(rows, columns=["code", "label", "lower", "upper"]).assign(factor=name)
+    else:
+        rows = [(MISSING_CODE, "Missing")] + [(i + 1, l) for i, l in enumerate(spec["levels"])]
+        t = pd.DataFrame(rows, columns=["code", "label"]).assign(factor=name)
+    return t.assign(base=t.label == spec.get("base"))
 
 
 def apply_spec(df, bands, suffix="_band", keep_raw=True):
@@ -320,7 +322,40 @@ def banded_table(df, col, spec, expo="exposure", claims="claim_count", cost=None
     return t
 
 
-def plot_relativities(t, title, cost=True, min_claims=None):
+NOT_BASE = {"Missing", "OTHER", "(other levels)", "N/A"}
+
+
+def pick_base(t, requested=None):
+    """
+    Choose the base level from a band table indexed by label: `requested` if it exists,
+    otherwise the level with the most exposure (never Missing / OTHER / N/A, must have claims).
+    Returns (label or None, how_chosen).
+    """
+    prefix = ""
+    if requested is not None:
+        if str(requested) in map(str, t.index):
+            return str(requested), "your choice"
+        prefix = f"'{requested}' not found, so "
+    cand = t[~t.index.astype(str).isin(NOT_BASE) & (t.claims > 0)]
+    if not len(cand):
+        return None, prefix + "no usable level: relativities left to the average"
+    return str(cand.exposure.idxmax()), prefix + "largest exposure"
+
+
+REL_COLS = {"freq_rel": "freq_rel", "sev_rel": "sev_rel", "bc_rel": "bc_rel",
+            "freq_smooth": "freq_rel", "sev_smooth": "sev_rel", "bc_smooth": "bc_rel"}
+
+
+def rebase(t, divisors):
+    """Divide relativity columns by the base level's values ({'freq_rel': x, ...})."""
+    t = t.copy()
+    for c, key in REL_COLS.items():
+        if c in t and key in divisors and np.isfinite(divisors[key]) and divisors[key] > 0:
+            t[c] = t[c] / divisors[key]
+    return t
+
+
+def plot_relativities(t, title, cost=True, min_claims=None, base=None):
     """Exposure bars (left axis) + burning cost / frequency / severity relativities (right axis)."""
     x = [str(i) for i in t.index]
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -348,6 +383,10 @@ def plot_relativities(t, title, cost=True, min_claims=None):
             fig.add_trace(go.Scatter(x=thin, y=[0] * len(thin), mode="markers", name=f"< {min_claims} claims",
                                      marker=dict(symbol="triangle-up", size=10, color=C_REF),
                                      hoverinfo="skip"), secondary_y=True)
+    if base is not None and base in x:
+        fig.add_trace(go.Scatter(x=[base], y=[1], mode="markers", name="Base level",
+                                 marker=dict(symbol="diamond", size=13, color="#1f1f1d", line=dict(color="white", width=2)),
+                                 hoverinfo="skip"), secondary_y=True)
     fig.add_shape(type="line", xref="paper", x0=0, x1=1, yref="y2", y0=1, y1=1,
                   line=dict(color=C_REF, width=1, dash="dot"))
     fig.update_layout(title=dict(text=title, y=0.97), template="plotly_white", hovermode="x unified",
@@ -355,12 +394,13 @@ def plot_relativities(t, title, cost=True, min_claims=None):
                       legend=dict(orientation="h", x=0, y=1.02, yanchor="bottom"))
     fig.update_xaxes(type="category", tickangle=-40 if len(x) > 8 else 0, automargin=True)
     fig.update_yaxes(title_text="Exposure", secondary_y=False, showgrid=False, tickformat=",.0f")
-    fig.update_yaxes(title_text="Relativity (1 = average)", secondary_y=True, rangemode="tozero",
+    fig.update_yaxes(title_text="Relativity (1 = base)" if base is not None else "Relativity (1 = average)",
+                     secondary_y=True, rangemode="tozero",
                      tickmode="auto", nticks=6, tickformat=".1f", showgrid=True)
     return fig
 
 
-def plot_stability(rel, title):
+def plot_stability(rel, title, base=None):
     """One line per period (light = oldest, dark = newest)."""
     periods = list(rel.columns)
     idx = np.linspace(0, len(BLUES) - 1, len(periods)).round().astype(int) if len(periods) > 1 else [3]
@@ -372,7 +412,8 @@ def plot_stability(rel, title):
                                  hovertemplate=f"{name}: %{{y:.2f}}<extra></extra>"))
     fig.add_hline(y=1, line=dict(color=C_REF, width=1, dash="dot"))
     fig.update_layout(title=dict(text=title, y=0.97), template="plotly_white", hovermode="x unified",
-                      height=400, yaxis_title="Relativity (1 = average)", yaxis_rangemode="tozero",
+                      height=400, yaxis_title="Relativity (1 = base)" if base else "Relativity (1 = average)",
+                      yaxis_rangemode="tozero",
                       margin=dict(t=90, b=20, l=70, r=70),
                       legend=dict(orientation="h", x=0, y=1.02, yanchor="bottom"))
     fig.update_xaxes(type="category", tickangle=-40 if len(rel) > 8 else 0, automargin=True)
@@ -453,7 +494,7 @@ def _fmt_any(v):
         return str(v)
 
 
-def plot_raw(t, kind, title, values=None, weights=None, cost=True, min_claims=100):
+def plot_raw(t, kind, title, values=None, weights=None, cost=True, min_claims=100, base=None):
     """
     Top: observed relativity per value/bin (dot size = claims) with a smoothed line.
     Bottom: where the exposure sits (exposure per value, or an exposure histogram).
@@ -530,7 +571,8 @@ def plot_raw(t, kind, title, values=None, weights=None, cost=True, min_claims=10
         fig.update_xaxes(type="log")
     if kind == "categorical":
         fig.update_xaxes(type="category", tickangle=-40 if len(x) > 8 else 0)
-    fig.update_yaxes(title_text="Relativity", range=[0, ymax], row=1, col=1, tickformat=".1f")
+    fig.update_yaxes(title_text="Relativity (1 = base)" if base else "Relativity (1 = average)",
+                     range=[0, ymax], row=1, col=1, tickformat=".1f")
     fig.update_yaxes(title_text="Exposure", row=2, col=1, tickformat=",.0f", rangemode="tozero")
     note = {"values": "every value", "bins": f"{len(t)} equal-exposure bins, unrounded",
             "categorical": f"every level ({len(t)})"}[kind]
@@ -577,13 +619,13 @@ def peril_tables(df, col, spec, perils, expo="exposure"):
     for p, (cc, kc) in perils.items():
         rel[p] = (g[kc] / g[expo]) / (d[kc].sum() / d[expo].sum())
         n[p], c[p] = g[cc], g[kc]
-    out = [pd.DataFrame(x) for x in (rel, n, c)]
+    out = [pd.DataFrame(x) for x in (rel, n, c)] + [g[[expo]].rename(columns={expo: "exposure"})]
     for t in out:
         t.index = idx
     return out
 
 
-def plot_peril_lines(rel, n, colours, title, min_claims=100):
+def plot_peril_lines(rel, n, colours, title, min_claims=100, base=None):
     """Burning cost relativity by peril. Hollow markers = fewer than that peril's min claims
     (min_claims can be a number or {peril: number})."""
     x = [str(i) for i in rel.index]
@@ -598,7 +640,8 @@ def plot_peril_lines(rel, n, colours, title, min_claims=100):
             hovertemplate=f"{p}: %{{y:.2f}} (%{{customdata:,.0f}} claims)<extra></extra>"))
     fig.add_hline(y=1, line=dict(color=C_REF, width=1, dash="dot"))
     fig.update_layout(title=dict(text=title, y=0.97), template="plotly_white", hovermode="x unified",
-                      height=430, yaxis_title="Burning cost relativity", yaxis_rangemode="tozero",
+                      height=430, yaxis_title="Burning cost relativity" + (" (1 = base)" if base else " (1 = average)"),
+                      yaxis_rangemode="tozero",
                       margin=dict(t=90, b=20, l=70, r=40), legend=dict(orientation="h", x=0, y=1.02, yanchor="bottom"))
     fig.update_xaxes(type="category", tickangle=-40 if len(x) > 8 else 0, automargin=True)
     return fig
@@ -623,7 +666,7 @@ def plot_peril_mix(c, colours, title):
 
 
 def peril_overview(df, factors, perils, expo="exposure", categorical=(), n_candidates=20,
-                   max_fine_levels=40, min_claims=100, report=None, show=False):
+                   max_fine_levels=40, min_claims=100, report=None, show=False, relativity_base="base_level"):
     """
     For each factor, on its fine grid: burning cost relativity by peril and the peril mix of
     claim cost. More than 8 perils: the smallest are grouped as "Other perils" in these charts.
@@ -642,8 +685,16 @@ def peril_overview(df, factors, perils, expo="exposure", categorical=(), n_candi
     for col in factors:
         print(f"peril overview: {col} ...")
         spec = fine_spec_for(d, col, col in categorical, expo, n_candidates, max_fine_levels)
-        rel, n, c = peril_tables(d, col, spec, perils, expo)
-        f1 = plot_peril_lines(rel, n, colours, f"{col} — burning cost relativity by peril (fine view)", min_claims)
+        rel, n, c, ex = peril_tables(d, col, spec, perils, expo)
+        base = None
+        if relativity_base == "base_level":
+            cand = ex[~ex.index.astype(str).isin(NOT_BASE)]
+            if len(cand):
+                base = str(cand.exposure.idxmax())     # same level for every peril (exposure-based)
+                b = rel.loc[base]
+                rel = rel.div(b.where(b > 0))
+        f1 = plot_peril_lines(rel, n, colours, f"{col} — burning cost relativity by peril (fine view"
+                              + (f", base = {base})" if base else ")"), min_claims, base)
         f2 = plot_peril_mix(c, colours, f"{col} — peril mix of claim cost (fine view)")
         if show:
             display(Markdown(f"---\n## {col}"))
@@ -658,7 +709,8 @@ def peril_overview(df, factors, perils, expo="exposure", categorical=(), n_candi
 def review_variable(df, col, expo="exposure", claims="claim_count", cost=None, period=None,
                     spec=None, categorical=False, min_claims=100, max_bands=15, n_candidates=20,
                     min_expo_share=0.01, max_fine_levels=40, show=True, report=None,
-                    show_raw=True, raw_bins=100, raw_max_levels=100, override_hint="OVERRIDES"):
+                    show_raw=True, raw_bins=100, raw_max_levels=100, override_hint="OVERRIDES",
+                    relativity_base="base_level", base=None, base_hint="BASE_LEVELS"):
     """
     Profile one factor, chart it on a fine grid, suggest bands (or use `spec` if given),
     chart the bands and their stability by period.
@@ -680,6 +732,16 @@ def review_variable(df, col, expo="exposure", claims="claim_count", cost=None, p
 
     fine = banded_table(df, col, fine_spec, expo, claims, cost)
     sugg = banded_table(df, col, spec, expo, claims, cost)
+
+    # base level: every view is divided by the base band's rates, so 1.00 means "same as the base"
+    base_label, base_how, div = None, "average", {}
+    if relativity_base == "base_level":
+        base_label, base_how = pick_base(sugg, base)
+        if base_label is not None:
+            row = sugg.loc[sugg.index.astype(str) == base_label].iloc[0]
+            div = {k: row[k] for k in ("freq_rel", "sev_rel", "bc_rel") if k in row}
+            fine, sugg = rebase(fine, div), rebase(sugg, div)
+    spec = {**spec, "base": base_label}
     cred = sugg[sugg.claims >= min_claims]
 
     info = {
@@ -689,6 +751,7 @@ def review_variable(df, col, expo="exposure", claims="claim_count", cost=None, p
         "distinct": s.nunique(),
         "missing_expo_%": round(100 * df.loc[s.isna(), expo].sum() / df[expo].sum(), 1),
         "bands": len(sugg),
+        "base": base_label if base_label is not None else "average",
         "thin_bands": int((sugg.claims < min_claims).sum()),
         "min_band_claims": int(sugg.claims.min()),
         "rel_min": round(cred[rel_col].min(), 2) if len(cred) else np.nan,
@@ -705,14 +768,17 @@ def review_variable(df, col, expo="exposure", claims="claim_count", cost=None, p
     fig_raw, tops = None, None
     if show_raw:
         raw, kind = raw_view_table(df, col, expo, claims, cost, not is_num, raw_bins, raw_max_levels)
+        raw = rebase(raw, div)
         m = s.notna()
         fig_raw = plot_raw(raw, kind, f"{col} — raw view", values=s[m].to_numpy(float) if kind == "bins" else None,
                            weights=df.loc[m, expo].to_numpy(float) if kind == "bins" else None,
-                           cost=bool(cost), min_claims=min_claims)
+                           cost=bool(cost), min_claims=min_claims, base=base_label)
         if kind == "bins":
             tops = top_values(df, col, expo)
     fig_fine = plot_relativities(fine, f"{col} — fine view ({len(fine)} levels)", bool(cost), min_claims)
-    fig_sugg = plot_relativities(sugg, f"{col} — {word.lower()}", bool(cost), min_claims)
+    fig_sugg = plot_relativities(sugg, f"{col} — {word.lower()}"
+                                 + (f" (base = {base_label})" if base_label else ""), bool(cost), min_claims,
+                                 base=base_label)
     fig_stab = None
     if period:
         codes = apply_band(df[spec.get("source", col)], spec)
@@ -720,7 +786,11 @@ def review_variable(df, col, expo="exposure", claims="claim_count", cost=None, p
         rel = rel.loc[sorted(rel.index, key=lambda c: (c == MISSING_CODE, c))]
         labels = label_table(col, spec).set_index("code")["label"]
         rel.index = labels.reindex(rel.index).to_numpy()
-        fig_stab = plot_stability(rel, f"{col} — {word.lower()} by {period} ({measure} relativity)")
+        if base_label is not None and base_label in rel.index:
+            b = rel.loc[base_label]
+            rel = rel.div(b.where(b > 0), axis=1)        # each period relative to its own base band
+        fig_stab = plot_stability(rel, f"{col} — {word.lower()} by {period} ({measure} relativity"
+                                  + (", each year vs its base band)" if base_label else ")"), base=base_label)
     spec_text = (f'"{col}": {{"edges": {spec["edges"]}}},' if is_num else
                  f'"{col}": {{"levels": {json.dumps(spec["levels"])}}},')     # paste into OVERRIDES
     profile = profile_numeric(df, col, expo).to_frame().T if is_num else None
@@ -741,7 +811,8 @@ def review_variable(df, col, expo="exposure", claims="claim_count", cost=None, p
 
     if report is not None:
         report.add_factor(col, info, profile, fig_fine, word, spec_text, sugg[cols], fig_sugg, fig_stab,
-                          min_claims, max_bands, fig_raw=fig_raw, top_values=tops, override_hint=override_hint)
+                          min_claims, max_bands, fig_raw=fig_raw, top_values=tops, override_hint=override_hint,
+                          base=(base_label, base_how, base_hint))
     return spec, info
 
 
@@ -751,7 +822,7 @@ def _tidy(x):
 
 
 def review_all(df, factors, expo="exposure", claims="claim_count", cost=None, period=None,
-               categorical=(), overrides=None, show=True, report=None, label="", **kw):
+               categorical=(), overrides=None, show=True, report=None, label="", bases=None, **kw):
     """
     Loop review_variable over every factor. Returns (BANDS, summary).
     categorical: factors to treat as categorical even if stored as numbers (e.g. trade codes).
@@ -763,7 +834,8 @@ def review_all(df, factors, expo="exposure", claims="claim_count", cost=None, pe
     for col in factors:
         print(f"reviewing {label + ': ' if label else ''}{col} ...")
         spec, info = review_variable(df, col, expo, claims, cost, period, spec=overrides.get(col),
-                                     categorical=col in categorical, show=show, report=report, **kw)
+                                     categorical=col in categorical, show=show, report=report,
+                                     base=(bases or {}).get(col), **kw)
         bands[col] = spec
         rows.append(info)
     summary = pd.DataFrame(rows).set_index("variable").sort_values("rel_spread", ascending=False)
@@ -1005,12 +1077,14 @@ class HtmlReport:
                            config={"displaylogo": False, "responsive": True})
 
     def add_factor(self, col, info, profile, fig_fine, word, spec_text, table, fig_sugg, fig_stab,
-                   min_claims, max_bands, fig_raw=None, top_values=None, override_hint="OVERRIDES"):
+                   min_claims, max_bands, fig_raw=None, top_values=None, override_hint="OVERRIDES",
+                   base=(None, "average", "BASE_LEVELS")):
         sid = _slug(col)
         stats = [("Type", info["type"]), ("Distinct values", f"{info['distinct']:,}"),
                  ("Missing exposure", f"{info['missing_expo_%']}%"), ("Bands", info["bands"]),
                  ("Bands under min claims", info["thin_bands"]),
                  ("Fewest claims in a band", f"{info['min_band_claims']:,}"),
+                 ("Base level", base[0] if base[0] is not None else "average"),
                  ("Relativity range", f"{_cell(info['rel_min'], '.2f')} – {_cell(info['rel_max'], '.2f')}")]
         stat_html = "".join(f'<div class="stat"><span>{_esc(k)}</span><b>{_esc(v)}</b></div>' for k, v in stats)
         prof_html = ""
@@ -1027,7 +1101,18 @@ class HtmlReport:
                           + _table(top_values, {"exposure": ",.0f", "expo_share": ".1%"},
                                    {"exposure": "Exposure", "expo_share": "Exposure %"}, index_name="Value"))
         thin = ["thin" if n < min_claims else "" for n in table.claims]
+        if base[0] is not None:
+            table = table.copy()
+            table.index = [f"{i}  (base)" if str(i) == base[0] else i for i in table.index]
+            table.index.name = "Band"
         tag = "override" if info["bands_from"] == "override" else "suggested"
+        if base[0] is not None:
+            base_html = (f'<p class="note">Relativities on every chart and table for this factor are relative '
+                         f'to the base level <b>{_esc(base[0])}</b> ({_esc(base[1])}). To use a different base, '
+                         f'put a line like this in {_esc(base[2])}:</p>'
+                         f'<pre>{_esc(json.dumps(col))}: {_esc(json.dumps(base[0]))},</pre>')
+        else:
+            base_html = f'<p class="note">Relativities are relative to the average ({_esc(base[1])}).</p>'
         raw_html = ""
         if fig_raw is not None:
             raw_html = self._blk("Raw view",
@@ -1037,7 +1122,7 @@ class HtmlReport:
         band_body = (f'<p class="note">Minimum {min_claims:,} claims per band, at most {max_bands} bands. '
                      f'Highlighted rows are below the minimum. Copy the line below into '
                      f'{_esc(override_hint)} to change it.</p>'
-                     f'<pre>{_esc(spec_text)}</pre>'
+                     f'<pre>{_esc(spec_text)}</pre>' + base_html
                      + _table(table, _BAND_FMT, _BAND_HDR, thin, index_name="Band") + self._fig(fig_sugg))
         stab_html = self._blk("Stability by period", self._fig(fig_stab)) if fig_stab is not None else ""
         self.sections.append(f"""
@@ -1065,7 +1150,7 @@ class HtmlReport:
         if self.summary is not None and not self.summary_html:
             s = self.summary.drop(columns=["rel_min", "rel_max"], errors="ignore")
             hdr = {"type": "Type", "bands_from": "Bands", "distinct": "Distinct", "missing_expo_%": "Missing exp. %",
-                   "bands": "No. bands", "thin_bands": "Under min claims", "min_band_claims": "Fewest claims",
+                   "bands": "No. bands", "base": "Base level", "thin_bands": "Under min claims", "min_band_claims": "Fewest claims",
                    "rel_spread": "Relativity spread"}
             summ = ("<h2>Summary</h2><p class='note'>Sorted by relativity spread (highest ÷ lowest relativity "
                     "across bands that meet the minimum claims) — a rough one-way guide to which factors "

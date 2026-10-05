@@ -126,7 +126,7 @@ def engineer(df, cfg):
         note(f, f"N/A for {(~app).sum():,} rows ({df.loc[~app, expo].sum() / tot:.1%} of exposure), coded {reserved[f]!r}; "
                 f"Unknown (missing where it applies): {df.loc[unknown, expo].sum() / max(df.loc[app, expo].sum(), 1e-9):.1%} "
                 f"of applicable exposure"
-                + (f"; note {had_value:,} N/A rows had a value that was overwritten" if had_value else ""))
+                + (f"; {had_value:,} of the N/A rows held a value (e.g. 0), now replaced by the N/A code" if had_value else ""))
     return df, log, reserved, found
 
 
