@@ -82,7 +82,14 @@ def engineer(df, cfg):
         df[f] = mapped.where(~unmapped, raw)
         note(f, f"mapping applied ({len(mp)} entries); {int(unmapped.sum()):,} rows had no mapping and were kept as is")
 
-    # 2. junk -> missing
+    # 2. junk -> missing; infinite values (e.g. a ratio divided by zero) are missing too
+    for f in cfg["FACTORS"]:
+        if f not in cfg.get("CATEGORICAL", []) and pd.api.types.is_float_dtype(df[f]):
+            inf = np.isinf(df[f].to_numpy(dtype=float, na_value=np.nan))
+            if inf.any():
+                note(f, f"{int(inf.sum()):,} infinite values (e.g. divided by zero) set to missing "
+                        f"({df.loc[inf, expo].sum() / tot:.1%} of exposure)")
+                df.loc[inf, f] = np.nan
     placeholders = [p.upper() for p in cfg.get("STRING_PLACEHOLDERS", STRING_PLACEHOLDERS)]
     for f in cfg["FACTORS"]:
         s = df[f]
